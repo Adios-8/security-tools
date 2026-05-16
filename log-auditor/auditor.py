@@ -211,6 +211,47 @@ def _make_bf_entry(ip: str, count: int, first_ts: datetime, last_ts: datetime) -
 
 
 # ---------------------------------------------------------------------------
+# 白名单
+# ---------------------------------------------------------------------------
+def load_whitelist(path: str | None) -> set[str]:
+    """从文件加载白名单，每行一个 IP 或用户名，空行和 # 注释行自动跳过。"""
+    if not path:
+        return set()
+    whitelist_path = Path(path)
+    if not whitelist_path.exists():
+        print(f"[WARN] 白名单文件不存在，忽略: {whitelist_path.resolve()}")
+        return set()
+    entries: set[str] = set()
+    with open(whitelist_path, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            entries.add(stripped)
+    print(f"[*] 已加载白名单: {len(entries)} 条 ({whitelist_path.resolve()})")
+    return entries
+
+
+def apply_whitelist(anomalies: list[dict], whitelist: set[str]) -> tuple[list[dict], int]:
+    """
+    过滤异常列表：若记录的 ip 或 user 字段出现在白名单中，则移除。
+    返回 (过滤后列表, 被过滤的数量)。
+    """
+    if not whitelist:
+        return anomalies, 0
+    filtered: list[dict] = []
+    skipped = 0
+    for a in anomalies:
+        ip = a.get("ip", "")
+        user = a.get("user", "")
+        if ip in whitelist or user in whitelist:
+            skipped += 1
+            continue
+        filtered.append(a)
+    return filtered, skipped
+
+
+# ---------------------------------------------------------------------------
 # 报告输出
 # ---------------------------------------------------------------------------
 def output_report(
@@ -272,6 +313,11 @@ def main() -> None:
         default=None,
         help="将 JSON 报告写入指定文件（可选）",
     )
+    parser.add_argument(
+        "--whitelist",
+        default=None,
+        help="白名单文件路径，每行一个 IP 或用户名（# 开头为注释）",
+    )
     args = parser.parse_args()
 
     # --- 1. 获取日志数据 ---
@@ -305,20 +351,32 @@ def main() -> None:
         print(report_json)
         return
 
-    # --- 3. 检测异常 ---
+    # --- 3. 加载白名单 ---
+    whitelist = load_whitelist(args.whitelist)
+
+    # --- 4. 检测异常 ---
     all_anomalies: list[dict] = []
     all_anomalies.extend(detect_off_hours(records))
     all_anomalies.extend(detect_brute_force(records))
+    raw_count = len(all_anomalies)
 
-    # --- 4. 输出报告 ---
+    # --- 5. 应用白名单过滤 ---
+    all_anomalies, filtered_count = apply_whitelist(all_anomalies, whitelist)
+    if filtered_count > 0:
+        print(f"[*] 白名单过滤: 排除 {filtered_count} 条异常（剩余 {len(all_anomalies)} 条）")
+
+    # --- 6. 输出报告 ---
     report_json = output_report(all_anomalies, len(records), source, args.output)
     print(report_json)
 
-    # --- 5. 简要摘要 ---
+    # --- 7. 简要摘要 ---
     if all_anomalies:
-        print(f"\n[!] 发现 {len(all_anomalies)} 个异常事件，请检查上述 JSON 详情")
+        print(f"\n[!] 发现 {len(all_anomalies)} 个异常事件（原始 {raw_count} 个，过滤 {filtered_count} 个）")
     else:
-        print("\n[OK] 未发现异常事件")
+        if raw_count > 0:
+            print(f"\n[OK] {raw_count} 个异常全部被白名单排除，最终报告无异常")
+        else:
+            print("\n[OK] 未发现异常事件")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,37 @@
+version: "3.8"
+
+# ---------------------------------------------------------------------------
+# 安全工具集 docker-compose 示例
+#
+# 构建:  docker compose build
+# 运行:  docker compose run <服务名> [额外参数]
+# ---------------------------------------------------------------------------
+
+services:
+
+  # --- 供应链漏洞扫描 ---
+  dep-scanner:
+    build: .
+    image: security-tools:latest
+    # 挂载项目目录（含 package.json）和报告输出目录
+    volumes:
+      - ./sample-project:/data:ro          # 只读挂载，减少误操作
+      - ./reports:/out                     # 报告写入这里
+    command: scanner --path /data --output /out/report.html
+
+  # --- 日志安全审计（文件模式）---
+  log-auditor:
+    build: .
+    image: security-tools:latest
+    volumes:
+      - ./sample-logs:/data:ro             # 只读挂载日志目录
+      - ./reports:/out
+    command: auditor --file /data/security.log --output /out/result.json
+
+  # --- 日志安全审计（测试模式）---
+  log-auditor-test:
+    build: .
+    image: security-tools:latest
+    command: auditor --test --output /out/audit-result.json
+    volumes:
+      - ./reports:/out

@@ -21,6 +21,7 @@ OSV_QUERY_URL = "https://api.osv.dev/v1/query"
 REQUEST_TIMEOUT = 30  # 秒
 MAX_RETRIES = 3
 RETRY_BACKOFF = 1.0  # 指数退避基数
+CACHE_TTL = 3600  # 缓存有效期（秒）
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +39,53 @@ def build_session() -> requests.Session:
     s.mount("https://", adapter)
     s.mount("http://", adapter)
     return s
+
+
+# ---------------------------------------------------------------------------
+# 缓存管理
+# ---------------------------------------------------------------------------
+def _cache_path() -> Path:
+    return Path(__file__).resolve().parent / "cache.json"
+
+
+def _load_cache() -> dict:
+    cp = _cache_path()
+    if not cp.exists():
+        return {}
+    try:
+        with open(cp, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"  [WARN] 缓存文件损坏，将重建: {exc}")
+        return {}
+
+
+def _save_cache(cache: dict) -> None:
+    cp = _cache_path()
+    try:
+        with open(cp, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except OSError as exc:
+        print(f"  [WARN] 无法写入缓存文件: {exc}")
+
+
+def _cache_key(name: str, version: str) -> str:
+    return f"{name}@{version}"
+
+
+def _cache_get(cache: dict, name: str, version: str) -> list | None:
+    key = _cache_key(name, version)
+    entry = cache.get(key)
+    if entry is None:
+        return None
+    if time.time() - entry["timestamp"] < CACHE_TTL:
+        return entry["vulns"]
+    del cache[key]
+    return None
+
+
+def _cache_put(cache: dict, name: str, version: str, vulns: list) -> None:
+    cache[_cache_key(name, version)] = {"timestamp": time.time(), "vulns": vulns}
 
 
 # ---------------------------------------------------------------------------
@@ -100,23 +148,41 @@ def query_osv(session: requests.Session, name: str, version: str) -> Optional[di
         return None
 
 
-def scan_dependencies(session: requests.Session, deps: dict[str, str]) -> list[dict]:
-    """逐包查询 OSV，汇总返回含漏洞信息的列表。"""
+def scan_dependencies(session: requests.Session, deps: dict[str, str], cache: dict) -> tuple[list[dict], dict]:
+    """逐包查询 OSV，优先读缓存。返回 (结果列表, 更新后的缓存)。"""
     results: list[dict] = []
     total = len(deps)
+    cache_hits = 0
+    api_calls = 0
+
     for idx, (name, version) in enumerate(deps.items(), 1):
         print(f"  [{idx}/{total}] 检查 {name}@{version} ...", end=" ")
-        data = query_osv(session, name, version)
-        vulns = data.get("vulns", []) if data else []
-        if vulns:
-            print(f"发现 {len(vulns)} 个漏洞")
+
+        # 尝试缓存
+        cached = _cache_get(cache, name, version)
+        if cached is not None:
+            vulns = cached
+            cache_hits += 1
+            tag = "[CACHE HIT]"
         else:
-            print("安全")
+            # 缓存未命中或过期 → 调 API
+            data = query_osv(session, name, version)
+            vulns = data.get("vulns", []) if data else []
+            _cache_put(cache, name, version, vulns)
+            api_calls += 1
+            tag = "[API CALL]"
+
+        if vulns:
+            print(f"发现 {len(vulns)} 个漏洞  {tag}")
+        else:
+            print(f"安全  {tag}")
         results.append({"name": name, "version": version, "vulns": vulns})
-        # 友好的节奏，避免触发严格的速率限制
+
         if idx < total:
             time.sleep(0.15)
-    return results
+
+    print(f"\n[*] 缓存命中 {cache_hits} 次，API 调用 {api_calls} 次")
+    return results, cache
 
 
 # ---------------------------------------------------------------------------
@@ -260,8 +326,11 @@ def main() -> None:
 
     # 3. 扫描
     session = build_session()
+    cache = _load_cache()
+    print(f"[*] 缓存条目: {len(cache)}，有效期: {CACHE_TTL // 60} 分钟")
     print("[*] 开始扫描 (OSV API) ...")
-    results = scan_dependencies(session, deps)
+    results, cache = scan_dependencies(session, deps, cache)
+    _save_cache(cache)
 
     # 4. 输出
     print_summary(results)
